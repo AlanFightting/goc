@@ -17,6 +17,7 @@
 package qiniu
 
 import (
+	"os"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -34,8 +35,36 @@ func TestFindBaseProfileFromQiniu(t *testing.T) {
 "qiniu.com/kodo/apiserver/server/main.go:32.49,33.13 1 30
 "qiniu.com/kodo/apiserver/server/main.go:42.49,43.13 1 0`
 
-	MockRouterAPI(router, mockProfileContent)
+	MockRouterAPI(router, mockProfileContent, 0)
 	getProfile, err := FindBaseProfileFromQiniu(qc, prowJobName, covProfileName)
 	assert.Equal(t, err, nil)
 	assert.Equal(t, string(getProfile), mockProfileContent)
+}
+
+func TestArtifacts_ProfilePath(t *testing.T) {
+	p := &ProfileArtifacts{
+		Directory:   "directory/",
+		ProfileName: "profile",
+	}
+	profilePath := p.ProfilePath()
+	assert.Equal(t, profilePath, "directory/profile")
+}
+
+func TestProfileArtifacts_CreateChangedProfile(t *testing.T) {
+	p := &ProfileArtifacts{
+		ChangedProfileName: "test.cov",
+	}
+	file := p.CreateChangedProfile()
+	file.Close()
+	defer os.Remove(p.ChangedProfileName)
+	_, err := os.Stat(p.ChangedProfileName)
+	assert.NoError(t, err)
+}
+
+func TestProfileArtifacts_GetChangedProfileName(t *testing.T) {
+	p := &ProfileArtifacts{
+		ChangedProfileName: "change.cov",
+	}
+	name := p.GetChangedProfileName()
+	assert.Equal(t, name, "change.cov")
 }

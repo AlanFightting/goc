@@ -20,6 +20,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strings"
@@ -29,6 +30,7 @@ import (
 	"github.com/spf13/viper"
 )
 
+// MvProjectsToTmp moves the projects into a temporary directory
 func (b *Build) MvProjectsToTmp() error {
 	listArgs := []string{"-json"}
 	if len(b.BuildFlags) != 0 {
@@ -67,17 +69,17 @@ func (b *Build) MvProjectsToTmp() error {
 }
 
 func (b *Build) mvProjectsToTmp() error {
-	b.TmpDir = filepath.Join(os.TempDir(), TmpFolderName(b.WorkingDir))
+	b.TmpDir = filepath.Join(os.TempDir(), tmpFolderName(b.WorkingDir))
 
 	// Delete previous tmp folder and its content
 	os.RemoveAll(b.TmpDir)
-	// Create a new tmp folder
-	err := os.MkdirAll(filepath.Join(b.TmpDir, "src"), os.ModePerm)
+	// Create a new tmp folder and a new importpath for storing cover variables
+	b.GlobalCoverVarImportPath = filepath.Join("src", tmpPackageName(b.WorkingDir))
+	err := os.MkdirAll(filepath.Join(b.TmpDir, b.GlobalCoverVarImportPath), os.ModePerm)
 	if err != nil {
-		log.Errorf("Fail to create the temporary build directory. The err is: %v", err)
-		return err
+		return fmt.Errorf("Fail to create the temporary build directory. The err is: %v", err)
 	}
-	log.Printf("Tmp project generated in: %v", b.TmpDir)
+	log.Infof("Tmp project generated in: %v", b.TmpDir)
 
 	// traverse pkg list to get project meta info
 	b.IsMod, b.Root, err = b.traversePkgsList()
@@ -88,7 +90,6 @@ func (b *Build) mvProjectsToTmp() error {
 	// we should get corresponding working directory in temporary directory
 	b.TmpWorkingDir, err = b.getTmpwd()
 	if err != nil {
-		log.Errorf("fail to get workding directory in temporary directory: %v", err)
 		return fmt.Errorf("getTmpwd failed with error: %w", err)
 	}
 	// issue #14
@@ -99,22 +100,43 @@ func (b *Build) mvProjectsToTmp() error {
 		b.cpLegacyProject()
 	} else if b.IsMod == true { // go 1.11, 1.12 has no Build.Root
 		b.cpGoModulesProject()
+		updated, newGoModContent, err := b.updateGoModFile()
+		if err != nil {
+			return fmt.Errorf("fail to generate new go.mod: %v", err)
+		}
+		if updated {
+			log.Infoln("go.mod needs rewrite")
+			tmpModFile := filepath.Join(b.TmpDir, "go.mod")
+			err := ioutil.WriteFile(tmpModFile, newGoModContent, os.ModePerm)
+			if err != nil {
+				return fmt.Errorf("fail to update go.mod: %v", err)
+			}
+		}
 	} else if b.IsMod == false && b.Root == "" {
 		b.TmpWorkingDir = b.TmpDir
 		b.cpNonStandardLegacy()
-	} else {
-		return fmt.Errorf("unknown project type: %w", ErrShouldNotReached)
 	}
 
 	log.Infof("New workingdir in tmp directory in: %v", b.TmpWorkingDir)
 	return nil
 }
 
-func TmpFolderName(path string) string {
+// tmpFolderName uses the first six characters of the input path's SHA256 checksum
+// as the suffix.
+func tmpFolderName(path string) string {
 	sum := sha256.Sum256([]byte(path))
 	h := fmt.Sprintf("%x", sum[:6])
 
 	return "goc-build-" + h
+}
+
+// tmpPackageName uses the first six characters of the input path's SHA256 checksum
+// as the suffix.
+func tmpPackageName(path string) string {
+	sum := sha256.Sum256([]byte(path))
+	h := fmt.Sprintf("%x", sum[:6])
+
+	return "gocbuild" + h
 }
 
 // traversePkgsList travse the Build.Pkgs list
@@ -131,6 +153,8 @@ func (b *Build) traversePkgsList() (isMod bool, root string, err error) {
 			return
 		}
 		isMod = true
+		b.ModRoot = v.Module.Dir
+		b.ModRootPath = v.Module.Path
 		return
 	}
 	log.Error(ErrShouldNotReached)
@@ -142,7 +166,7 @@ func (b *Build) traversePkgsList() (isMod bool, root string, err error) {
 // and store it in the Build.tmpWorkdingDir
 func (b *Build) getTmpwd() (string, error) {
 	for _, pkg := range b.Pkgs {
-		index := -1
+		var index int
 		var parentPath string
 		if b.IsMod == false {
 			index = strings.Index(b.WorkingDir, pkg.Root)
@@ -169,7 +193,7 @@ func (b *Build) findWhereToInstall() (string, error) {
 
 	if false == b.IsMod {
 		if b.Root == "" {
-			return "", ErrNoplaceToInstall
+			return "", ErrNoPlaceToInstall
 		}
 		return filepath.Join(b.Root, "bin"), nil
 	}

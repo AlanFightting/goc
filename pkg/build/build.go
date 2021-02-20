@@ -41,7 +41,9 @@ type Build struct {
 	// Project Root:
 	// 1. legacy, root == GOPATH
 	// 2. mod, root == go.mod Dir
-	Target string // the binary name that go build generate
+	ModRoot     string // path for go.mod
+	ModRootPath string // import path for the whole project
+	Target      string // the binary name that go build generate
 	// keep compatible with go commands:
 	// go run [build flags] [-exec xprog] package [arguments...]
 	// go build [-o output] [-i] [build flags] [packages]
@@ -50,6 +52,10 @@ type Build struct {
 	Packages       string // Packages that needs to build
 	GoRunExecFlag  string // for the -exec flags in go run command
 	GoRunArguments string // for the '[arguments]' parameters in go run command
+
+	OneMainPackage           bool   // whether this build is a go build or go install? true: build, false: install
+	GlobalCoverVarImportPath string // Importpath for storing cover variables
+	GlobalCoverVarFilePath   string // Importpath for storing cover variables
 }
 
 // NewBuild creates a Build struct which can build from goc temporary directory,
@@ -79,6 +85,7 @@ func NewBuild(buildflags string, args []string, workingDir string, outputDir str
 	return b, nil
 }
 
+// Build calls 'go build' tool to do building
 func (b *Build) Build() error {
 	log.Infoln("Go building in temp...")
 	// new -o will overwrite  previous ones
@@ -96,11 +103,9 @@ func (b *Build) Build() error {
 	log.Printf("go build cmd is: %v", cmd.Args)
 	err := cmd.Start()
 	if err != nil {
-		log.Errorf("Fail to execute: %v. The error is: %v", cmd.Args, err)
 		return fmt.Errorf("fail to execute: %v, err: %w", cmd.Args, err)
 	}
 	if err = cmd.Wait(); err != nil {
-		log.Errorf("go build failed. The error is: %v", err)
 		return fmt.Errorf("fail to execute: %v, err: %w", cmd.Args, err)
 	}
 	log.Infoln("Go build exit successful.")
@@ -111,16 +116,15 @@ func (b *Build) Build() error {
 // the binary name is always same as the directory name of current directory
 func (b *Build) determineOutputDir(outputDir string) (string, error) {
 	if b.TmpDir == "" {
-		log.Errorf("Can only be called after Build.MvProjectsToTmp(): %v", ErrWrongCallSequence)
-		return "", fmt.Errorf("can only be called after Build.MvProjectsToTmp(): %w", ErrWrongCallSequence)
+		return "", fmt.Errorf("can only be called after Build.MvProjectsToTmp(): %w", ErrEmptyTempWorkingDir)
 	}
 
 	// fix #43
 	if outputDir != "" {
 		abs, err := filepath.Abs(outputDir)
 		if err != nil {
-			log.Errorf("Fail to transform the path: %v to absolute path: %v", outputDir, err)
-			return "", err
+			return "", fmt.Errorf("Fail to transform the path: %v to absolute path: %v", outputDir, err)
+
 		}
 		return abs, nil
 	}
@@ -129,8 +133,11 @@ func (b *Build) determineOutputDir(outputDir string) (string, error) {
 	targetName := ""
 	for _, pkg := range b.Pkgs {
 		if pkg.Name == "main" {
-			_, file := filepath.Split(pkg.Target)
-			targetName = file
+			if pkg.Target != "" {
+				targetName = filepath.Base(pkg.Target)
+			} else {
+				targetName = filepath.Base(pkg.Dir)
+			}
 			break
 		}
 	}

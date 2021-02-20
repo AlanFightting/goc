@@ -70,7 +70,7 @@ func TestCheckParameters(t *testing.T) {
 func TestDetermineOutputDir(t *testing.T) {
 	b := &Build{}
 	_, err := b.determineOutputDir("")
-	assert.Equal(t, errors.Is(err, ErrWrongCallSequence), true, "called before Build.MvProjectsToTmp() should fail")
+	assert.Equal(t, errors.Is(err, ErrEmptyTempWorkingDir), true, "called before Build.MvProjectsToTmp() should fail")
 
 	b.TmpDir = "fake"
 	_, err = b.determineOutputDir("xx")
@@ -89,4 +89,13 @@ func TestInvalidPackageNameForBuild(t *testing.T) {
 	if !assert.Equal(t, err, ErrWrongPackageTypeForBuild) {
 		assert.FailNow(t, "should not success with non . or ./... package")
 	}
+}
+
+// test NewBuild with wrong parameters
+func TestNewBuildWithWrongParameters(t *testing.T) {
+	_, err := NewBuild("", []string{"a.go", "b.go"}, "cur", "cur")
+	assert.Equal(t, err, ErrTooManyArgs)
+
+	_, err = NewBuild("", []string{"a.go"}, "", "cur")
+	assert.Equal(t, err, ErrInvalidWorkingDir)
 }

@@ -25,26 +25,43 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"regexp"
 
 	"github.com/gin-gonic/gin"
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/tools/cover"
 	"k8s.io/test-infra/gopherage/pkg/cov"
-	"strconv"
 )
-
-// DefaultStore implements the IPersistence interface
-var DefaultStore Store
 
 // LogFile a file to save log.
 const LogFile = "goc.log"
 
-func init() {
-	DefaultStore = NewFileStore()
+type server struct {
+	PersistenceFile string
+	Store           Store
+}
+
+// NewFileBasedServer new a file based server with persistenceFile
+func NewFileBasedServer(persistenceFile string) (*server, error) {
+	store, err := NewFileStore(persistenceFile)
+	if err != nil {
+		return nil, err
+	}
+	return &server{
+		PersistenceFile: persistenceFile,
+		Store:           store,
+	}, nil
+}
+
+// NewMemoryBasedServer new a memory based server without persistenceFile
+func NewMemoryBasedServer() *server {
+	return &server{
+		Store: NewMemoryStore(),
+	}
 }
 
 // Run starts coverage host center
-func Run(port string) {
+func (s *server) Run(port string) {
 	f, err := os.Create(LogFile)
 	if err != nil {
 		log.Fatalf("failed to create log file %s, err: %v", LogFile, err)
@@ -52,52 +69,56 @@ func Run(port string) {
 
 	// both log to stdout and file by default
 	mw := io.MultiWriter(f, os.Stdout)
-	r := GocServer(mw)
+	r := s.Route(mw)
 	log.Fatal(r.Run(port))
 }
 
-// GocServer init goc server engine
-func GocServer(w io.Writer) *gin.Engine {
+// Router init goc server engine
+func (s *server) Route(w io.Writer) *gin.Engine {
 	if w != nil {
 		gin.DefaultWriter = w
 	}
 	r := gin.Default()
 	// api to show the registered services
-	r.StaticFile(PersistenceFile, "./"+PersistenceFile)
+	r.StaticFile("static", "./"+s.PersistenceFile)
 
 	v1 := r.Group("/v1")
 	{
-		v1.POST("/cover/register", registerService)
-		v1.GET("/cover/profile", profile)
-		v1.POST("/cover/clear", clear)
-		v1.POST("/cover/init", initSystem)
-		v1.GET("/cover/list", listServices)
+		v1.POST("/cover/register", s.registerService)
+		v1.GET("/cover/profile", s.profile)
+		v1.POST("/cover/profile", s.profile)
+		v1.POST("/cover/clear", s.clear)
+		v1.POST("/cover/init", s.initSystem)
+		v1.GET("/cover/list", s.listServices)
+		v1.POST("/cover/remove", s.removeServices)
 	}
 
 	return r
 }
 
-// Service is a entry under being tested
-type Service struct {
+// ServiceUnderTest is a entry under being tested
+type ServiceUnderTest struct {
 	Name    string `form:"name" json:"name" binding:"required"`
 	Address string `form:"address" json:"address" binding:"required"`
 }
 
-// ProfileParam is param of profile API (TODO)
+// ProfileParam is param of profile API
 type ProfileParam struct {
-	Force   bool     `form:"force"`
-	Service []string `form:"service" json:"service"`
-	Address []string `form:"address" json:"address"`
+	Force             bool     `form:"force" json:"force"`
+	Service           []string `form:"service" json:"service"`
+	Address           []string `form:"address" json:"address"`
+	CoverFilePatterns []string `form:"coverfile" json:"coverfile"`
+	SkipFilePatterns  []string `form:"skipfile" json:"skipfile"`
 }
 
 //listServices list all the registered services
-func listServices(c *gin.Context) {
-	services := DefaultStore.GetAll()
+func (s *server) listServices(c *gin.Context) {
+	services := s.Store.GetAll()
 	c.JSON(http.StatusOK, services)
 }
 
-func registerService(c *gin.Context) {
-	var service Service
+func (s *server) registerService(c *gin.Context) {
+	var service ServiceUnderTest
 	if err := c.ShouldBind(&service); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
@@ -116,13 +137,13 @@ func registerService(c *gin.Context) {
 
 	realIP := c.ClientIP()
 	if host != realIP {
-		log.Printf("the registed host %s of service %s is different with the real one %s, here we choose the real one", service.Name, host, realIP)
+		log.Printf("the registered host %s of service %s is different with the real one %s, here we choose the real one", service.Name, host, realIP)
 		service.Address = fmt.Sprintf("http://%s:%s", realIP, port)
 	}
 
-	address := DefaultStore.Get(service.Name)
+	address := s.Store.Get(service.Name)
 	if !contains(address, service.Address) {
-		if err := DefaultStore.Add(service); err != nil {
+		if err := s.Store.Add(service); err != nil && err != ErrServiceAlreadyRegistered {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return
 		}
@@ -132,45 +153,46 @@ func registerService(c *gin.Context) {
 	return
 }
 
-func profile(c *gin.Context) {
-	force, err := strconv.ParseBool(c.Query("force"))
-	if err != nil {
-		c.JSON(http.StatusExpectationFailed, gin.H{"error": "invalid param"})
+// profile API examples:
+// POST /v1/cover/profile
+// { "force": "true", "service":["a","b"], "address":["c","d"],"coverfile":["e","f"] }
+func (s *server) profile(c *gin.Context) {
+	var body ProfileParam
+	if err := c.ShouldBind(&body); err != nil {
+		c.JSON(http.StatusExpectationFailed, gin.H{"error": err.Error()})
 		return
 	}
-	svrList := c.QueryArray("service")
-	addrList := c.QueryArray("address")
-	svrsAll := DefaultStore.GetAll()
-	svrsUnderTest, err := getSvrUnderTest(svrList, addrList, force, svrsAll)
+
+	allInfos := s.Store.GetAll()
+	filterAddrList, err := filterAddrs(body.Service, body.Address, body.Force, allInfos)
 	if err != nil {
 		c.JSON(http.StatusExpectationFailed, gin.H{"error": err.Error()})
+		return
 	}
 
 	var mergedProfiles = make([][]*cover.Profile, 0)
-	for _, svrs := range svrsUnderTest {
-		for _, addr := range svrs {
-			pp, err := NewWorker(addr).Profile(ProfileParam{})
-			if err != nil {
-				if force {
-					continue
-				}
-				c.JSON(http.StatusExpectationFailed, gin.H{"error": err.Error()})
-				return
+	for _, addr := range filterAddrList {
+		pp, err := NewWorker(addr).Profile(ProfileParam{})
+		if err != nil {
+			if body.Force {
+				log.Warnf("get profile from [%s] failed, error: %s", addr, err.Error())
+				continue
 			}
-			profile, err := convertProfile(pp)
-			if err != nil {
-				if force {
-					continue
-				}
-				c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-				return
-			}
-			mergedProfiles = append(mergedProfiles, profile)
+
+			c.JSON(http.StatusExpectationFailed, gin.H{"error": fmt.Sprintf("failed to get profile from %s, error %s", addr, err.Error())})
+			return
 		}
+
+		profile, err := convertProfile(pp)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+		mergedProfiles = append(mergedProfiles, profile)
 	}
 
 	if len(mergedProfiles) == 0 {
-		c.JSON(http.StatusOK, "no profiles")
+		c.JSON(http.StatusExpectationFailed, gin.H{"error": "no profiles"})
 		return
 	}
 
@@ -180,33 +202,124 @@ func profile(c *gin.Context) {
 		return
 	}
 
+	if len(body.CoverFilePatterns) > 0 {
+		merged, err = filterProfile(body.CoverFilePatterns, merged)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to filter profile based on the patterns: %v, error: %v", body.CoverFilePatterns, err)})
+			return
+		}
+	}
+
+	if len(body.SkipFilePatterns) > 0 {
+		merged, err = skipProfile(body.SkipFilePatterns, merged)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to skip profile based on the patterns: %v, error: %v", body.SkipFilePatterns, err)})
+			return
+		}
+	}
+
 	if err := cov.DumpProfile(merged, c.Writer); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 }
 
-func clear(c *gin.Context) {
-	svrsUnderTest := DefaultStore.GetAll()
-	for svc, addrs := range svrsUnderTest {
-		for _, addr := range addrs {
-			pp, err := NewWorker(addr).Clear()
+// filterProfile filters profiles of the packages matching the coverFile pattern
+func filterProfile(coverFile []string, profiles []*cover.Profile) ([]*cover.Profile, error) {
+	var out = make([]*cover.Profile, 0)
+	for _, profile := range profiles {
+		for _, pattern := range coverFile {
+			matched, err := regexp.MatchString(pattern, profile.FileName)
 			if err != nil {
-				c.JSON(http.StatusExpectationFailed, gin.H{"error": err.Error()})
-				return
+				return nil, fmt.Errorf("filterProfile failed with pattern %s for profile %s, err: %v", pattern, profile.FileName, err)
 			}
-			fmt.Fprintf(c.Writer, "Register service %s: %s coverage counter %s", svc, addr, string(pp))
+			if matched {
+				out = append(out, profile)
+				break // no need to check again for the file
+			}
 		}
 	}
+
+	return out, nil
 }
 
-func initSystem(c *gin.Context) {
-	if err := DefaultStore.Init(); err != nil {
+// skipProfile skips profiles of the packages matching the skipFile pattern
+func skipProfile(skipFile []string, profiles []*cover.Profile) ([]*cover.Profile, error) {
+	var out = make([]*cover.Profile, 0)
+	for _, profile := range profiles {
+		var shouldSkip bool
+		for _, pattern := range skipFile {
+			matched, err := regexp.MatchString(pattern, profile.FileName)
+			if err != nil {
+				return nil, fmt.Errorf("filterProfile failed with pattern %s for profile %s, err: %v", pattern, profile.FileName, err)
+			}
+
+			if matched {
+				shouldSkip = true
+				break // no need to check again for the file
+			}
+		}
+
+		if !shouldSkip {
+			out = append(out, profile)
+		}
+	}
+
+	return out, nil
+}
+
+func (s *server) clear(c *gin.Context) {
+	var body ProfileParam
+	if err := c.ShouldBind(&body); err != nil {
+		c.JSON(http.StatusExpectationFailed, gin.H{"error": err.Error()})
+		return
+	}
+	svrsUnderTest := s.Store.GetAll()
+	filterAddrList, err := filterAddrs(body.Service, body.Address, true, svrsUnderTest)
+	if err != nil {
+		c.JSON(http.StatusExpectationFailed, gin.H{"error": err.Error()})
+		return
+	}
+	for _, addr := range filterAddrList {
+		pp, err := NewWorker(addr).Clear(ProfileParam{})
+		if err != nil {
+			c.JSON(http.StatusExpectationFailed, gin.H{"error": err.Error()})
+			return
+		}
+		fmt.Fprintf(c.Writer, "Register service %s coverage counter %s", addr, string(pp))
+	}
+
+}
+
+func (s *server) initSystem(c *gin.Context) {
+	if err := s.Store.Init(); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 
 	c.JSON(http.StatusOK, "")
+}
+
+func (s *server) removeServices(c *gin.Context) {
+	var body ProfileParam
+	if err := c.ShouldBind(&body); err != nil {
+		c.JSON(http.StatusExpectationFailed, gin.H{"error": err.Error()})
+		return
+	}
+	svrsUnderTest := s.Store.GetAll()
+	filterAddrList, err := filterAddrs(body.Service, body.Address, true, svrsUnderTest)
+	if err != nil {
+		c.JSON(http.StatusExpectationFailed, gin.H{"error": err.Error()})
+		return
+	}
+	for _, addr := range filterAddrList {
+		err := s.Store.Remove(addr)
+		if err != nil {
+			c.JSON(http.StatusExpectationFailed, gin.H{"error": err.Error()})
+			return
+		}
+		fmt.Fprintf(c.Writer, "Register service %s removed from the center.", addr)
+	}
 }
 
 func convertProfile(p []byte) ([]*cover.Profile, error) {
@@ -235,48 +348,45 @@ func contains(arr []string, str string) bool {
 	return false
 }
 
-// getSvrUnderTest get service map by service and address list
-func getSvrUnderTest(svrList, addrList []string, force bool, svrsAll map[string][]string) (svrsUnderTest map[string][]string, err error) {
-	svrsUnderTest = map[string][]string{}
-	if len(svrList) != 0 && len(addrList) != 0 {
-		return nil, fmt.Errorf("use this flag and 'address' flag at the same time is illegal")
+// filterAddrs filter address list by given service and address list
+func filterAddrs(serviceList, addressList []string, force bool, allInfos map[string][]string) (filterAddrList []string, err error) {
+	addressAll := []string{}
+	for _, addr := range allInfos {
+		addressAll = append(addressAll, addr...)
 	}
-	// Return all servers when all param is nil
-	if len(svrList) == 0 && len(addrList) == 0 {
-		return svrsAll, nil
-	} else {
-		// Add matched services to map
-		if len(svrList) != 0 {
-			for _, name := range svrList {
-				if addr, ok := svrsAll[name]; ok {
-					svrsUnderTest[name] = addr
-					continue // jump to match the next service
-				}
-				if !force {
-					return nil, fmt.Errorf("service [%s] not found", name)
-				}
-			}
-		}
-		// Add matched addresses to map
-		if len(addrList) != 0 {
-		I:
-			for _, addr := range addrList {
-				for svr, addrs := range svrsAll {
-					if contains(svrsUnderTest[svr], addr) {
-						continue I // The address is duplicate, jump over
-					}
-					for _, a := range addrs {
-						if a == addr {
-							svrsUnderTest[svr] = append(svrsUnderTest[svr], a)
-							continue I // jump to match the next address
-						}
-					}
-				}
-				if !force {
-					return nil, fmt.Errorf("address [%s] not found", addr)
-				}
-			}
-		}
+
+	if len(serviceList) != 0 && len(addressList) != 0 {
+		return nil, fmt.Errorf("use 'service' flag and 'address' flag at the same time may cause ambiguity, please use them separately")
 	}
-	return svrsUnderTest, nil
+
+	// Add matched services to map
+	for _, name := range serviceList {
+		if addr, ok := allInfos[name]; ok {
+			filterAddrList = append(filterAddrList, addr...)
+			continue // jump to match the next service
+		}
+		if !force {
+			return nil, fmt.Errorf("service [%s] not found", name)
+		}
+		log.Warnf("service [%s] not found", name)
+	}
+
+	// Add matched addresses to map
+	for _, addr := range addressList {
+		if contains(addressAll, addr) {
+			filterAddrList = append(filterAddrList, addr)
+			continue
+		}
+		if !force {
+			return nil, fmt.Errorf("address [%s] not found", addr)
+		}
+		log.Warnf("address [%s] not found", addr)
+	}
+
+	if len(addressList) == 0 && len(serviceList) == 0 {
+		filterAddrList = addressAll
+	}
+
+	// Return all services when all param is nil
+	return filterAddrList, nil
 }

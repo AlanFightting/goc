@@ -5,9 +5,11 @@ on:
   push:
     paths-ignore:
       - '**.md'
+      - '**.png'
   pull_request:
     paths-ignore:
       - '**.md'
+      - '**.png'
 jobs:
   job_1:
     name: Build goc binary
@@ -41,7 +43,7 @@ jobs:
     needs: job_1
     strategy:
       matrix:
-        go-version: [1.11.x, 1.12.x, 1.13.x, 1.14.x]
+        go-version: [1.11.x, 1.12.x, 1.13.x, 1.14.x, 1.15.x, 1.16.x]
     runs-on: ubuntu-latest
     steps:
       - name: Install Go
@@ -60,6 +62,8 @@ jobs:
           cd bats-core
           sudo ./install.sh /usr/local
       - name: Do test
+        env:
+          GOVERSION: ${{ matrix.go-version }}
         run: |
           chmod +x /home/runner/tools/goc/goc
           export PATH=/home/runner/tools/goc:$PATH

@@ -13,6 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+load util.sh
+
 setup_file() {
     # run centered server
     goc server 3>&- &
@@ -20,15 +22,15 @@ setup_file() {
     sleep 2
     goc init
     # run covered goc
-    gocc server --port=:60001 --debug 3>&- &
+    gocc server --port=:60001 --local-persistence="persistence/servicesAll.txt" --debug 3>&- &
     GOCC_PID=$!
     sleep 2
-    echo "goc gocc server started"
+    info "goc gocc server started"
 }
 
 teardown_file() {
     # collect from center
-    goc profile --debug -o filtered.cov
+    goc profile --debug -o filtered-server.cov
     kill -9 $GOC_PID
     kill -9 $GOCC_PID
 }
@@ -39,7 +41,9 @@ teardown_file() {
     [ "$status" -eq 0 ]
     # connect to covered goc
     run goc profile --center=http://127.0.0.1:60001
-    [ "$status" -eq 0 ]
+    # no profiles
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"no profiles"* ]]
 }
 
 @test "register a covered service" {
@@ -52,5 +56,12 @@ teardown_file() {
     sleep 1
     # connect to covered goc
     run goc profile --center=http://127.0.0.1:60001
-    [ "$status" -eq 0 ]    
+    [ "$status" -eq 0 ]
+
+    # verify the persistence file exist
+    [ -f "$WORKDIR/persistence/servicesAll.txt" ]
+    # remove goc persistence file
+    run goc init --center=http://127.0.0.1:60001
+    [ "$status" -eq 0 ]
+    [ ! -f "$WORKDIR/persistence/servicesAll.txt" ]
 }

@@ -5,15 +5,17 @@ on:
   push:
     paths-ignore:
       - '**.md'
+      - '**.png'
   pull_request:
     paths-ignore:
       - '**.md'
+      - '**.png'
 jobs:
   run:
     name: vet and gofmt
     strategy:
       matrix:
-        go-version: [1.13.x, 1.14.x]
+        go-version: [1.13.x, 1.14.x, 1.15.x]
     runs-on: ubuntu-latest
     steps:
       - name: Install Go

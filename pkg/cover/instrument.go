@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"os"
 	"path"
+	"path/filepath"
 	"text/template"
 )
 
@@ -44,6 +45,8 @@ package main
 
 import (
 	"bufio"
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -51,18 +54,14 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"testing"
-	"path/filepath"
 
-	{{range $i, $pkgCover := .DepsCover}}
-	_cover{{$i}} {{$pkgCover.Package.ImportPath | printf "%q"}}
-	{{end}}
-
-	{{range $k, $pkgCover := .CacheCover}}
-	{{$pkgCover.Package.ImportPath | printf "%q"}}
-	{{end}}
+	_cover {{.GlobalCoverVarImportPath | printf "%q"}}
 
 )
 
@@ -78,18 +77,12 @@ func loadValues() (map[string][]uint32, map[string][]testing.CoverBlock) {
 
 	{{range $i, $pkgCover := .DepsCover}}
 	{{range $file, $cover := $pkgCover.Vars}}
-	loadFileCover(coverCounters, coverBlocks, {{printf "%q" $cover.File}}, _cover{{$i}}.{{$cover.Var}}.Count[:], _cover{{$i}}.{{$cover.Var}}.Pos[:], _cover{{$i}}.{{$cover.Var}}.NumStmt[:])
+	loadFileCover(coverCounters, coverBlocks, {{printf "%q" $cover.File}}, _cover.{{$cover.Var}}.Count[:], _cover.{{$cover.Var}}.Pos[:], _cover.{{$cover.Var}}.NumStmt[:])
 	{{end}}
 	{{end}}
 
 	{{range $file, $cover := .MainPkgCover.Vars}}
-	loadFileCover(coverCounters, coverBlocks, {{printf "%q" $cover.File}}, {{$cover.Var}}.Count[:], {{$cover.Var}}.Pos[:], {{$cover.Var}}.NumStmt[:])
-	{{end}}
-
-	{{range $k, $pkgCover := .CacheCover}}
-	{{range $v, $cover := $pkgCover.Vars}}
-	loadFileCover(coverCounters, coverBlocks, {{printf "%q" $cover.File}}, {{$pkgCover.Package.Name}}.{{$v}}.Count[:], {{$pkgCover.Package.Name}}.{{$v}}.Pos[:], {{$pkgCover.Package.Name}}.{{$v}}.NumStmt[:])
-	{{end}}
+	loadFileCover(coverCounters, coverBlocks, {{printf "%q" $cover.File}}, _cover.{{$cover.Var}}.Count[:], _cover.{{$cover.Var}}.Pos[:], _cover.{{$cover.Var}}.NumStmt[:])
 	{{end}}
 
 	return coverCounters, coverBlocks
@@ -121,18 +114,12 @@ func clearValues() {
 
 	{{range $i, $pkgCover := .DepsCover}}
 	{{range $file, $cover := $pkgCover.Vars}}
-	clearFileCover(_cover{{$i}}.{{$cover.Var}}.Count[:])
+	clearFileCover(_cover.{{$cover.Var}}.Count[:])
 	{{end}}
 	{{end}}
 
 	{{range $file, $cover := .MainPkgCover.Vars}}
-	clearFileCover({{$cover.Var}}.Count[:])
-	{{end}}
-
-	{{range $k, $pkgCover := .CacheCover}}
-	{{range $v, $cover := $pkgCover.Vars}}
-	clearFileCover({{$pkgCover.Package.Name}}.{{$v}}.Count[:])
-	{{end}}
+	clearFileCover(_cover.{{$cover.Var}}.Count[:])
 	{{end}}
 
 }
@@ -153,7 +140,24 @@ func registerHandlers() {
 	if resp, err := registerSelf(profileAddr); err != nil {
 		log.Fatalf("register address %v failed, err: %v, response: %v", profileAddr, err, string(resp))
 	}
-	go genProfileAddr(host)
+
+	fn := func() {
+		var (
+			err          error
+			profileAddrs []string
+			addresses    []string
+		)
+		if addresses, err = getAllHosts(ln); err != nil {
+				log.Fatalf("get all host failed, err: %v", err)
+				return
+		}
+		for _, addr := range addresses {
+				profileAddrs = append(profileAddrs, "http://"+addr)
+		}
+		deregisterSelf(profileAddrs)
+	}
+	go watchSignal(fn)
+
 	mux := http.NewServeMux()
 	// Coverage reports the current code coverage as a fraction in the range [0, 1].
 	// If coverage is not enabled, Coverage returns 0.
@@ -177,7 +181,7 @@ func registerHandlers() {
 
 	// coverprofile reports a coverage profile with the coverage percentage
 	mux.HandleFunc("/v1/cover/profile", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprint(w, "mode: {{.Mode }} \n")
+		fmt.Fprint(w, "mode: {{.Mode}}\n")
 		counters, blocks := loadValues()
 		var active, total int64
 		var count uint32
@@ -206,7 +210,7 @@ func registerHandlers() {
 	mux.HandleFunc("/v1/cover/clear", func(w http.ResponseWriter, r *http.Request) {
 		clearValues()
 		w.WriteHeader(http.StatusOK)
-		fmt.Fprintln(w,"clear call successfully")
+		fmt.Fprintln(w, "clear call successfully")
 	})
 
 	log.Fatal(http.Serve(ln, mux))
@@ -225,11 +229,10 @@ func registerSelf(address string) ([]byte, error) {
 		log.Printf("[goc][WARN]error occurred:%v, try again", err)
 		resp, err = http.DefaultClient.Do(req)
 	}
-	defer resp.Body.Close()
-
 	if err != nil {
 		return nil, fmt.Errorf("failed to register into coverage center, err:%v", err)
 	}
+	defer resp.Body.Close()
 
 	body, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
@@ -243,6 +246,64 @@ func registerSelf(address string) ([]byte, error) {
 	return body, err
 }
 
+func deregisterSelf(address []string) ([]byte, error) {
+        param := map[string]interface{}{
+                "address": address,
+        }
+        jsonBody, err := json.Marshal(param)
+        if err != nil {
+                return nil, err
+        }
+        req, err := http.NewRequest("POST", fmt.Sprintf("%s/v1/cover/remove", {{.Center | printf "%q"}}), bytes.NewReader(jsonBody))
+        if err != nil {
+                log.Fatalf("http.NewRequest failed: %v", err)
+                return nil, err
+        }
+        req.Header.Set("Content-Type", "application/json")
+
+        resp, err := http.DefaultClient.Do(req)
+        if err != nil && isNetworkError(err) {
+                log.Printf("[goc][WARN]error occurred:%v, try again", err)
+                resp, err = http.DefaultClient.Do(req)
+        }
+        if err != nil {
+                return nil, fmt.Errorf("failed to deregister into coverage center, err:%v", err)
+        }
+        defer resp.Body.Close()
+
+        body, err := ioutil.ReadAll(resp.Body)
+        if err != nil {
+                return nil, fmt.Errorf("failed to read response body, err:%v", err)
+        }
+
+        if resp.StatusCode != 200 {
+                err = fmt.Errorf("failed to deregister into coverage center, response code %d", resp.StatusCode)
+        }
+
+        return body, err
+}
+
+type CallbackFunc func()
+
+func watchSignal(fn CallbackFunc) {
+        defer fn()
+
+        // init signal
+        c := make(chan os.Signal, 1)
+        signal.Notify(c, syscall.SIGHUP, syscall.SIGQUIT, syscall.SIGTERM, syscall.SIGINT)
+        for {
+                si := <-c
+                log.Printf("get a signal %s", si.String())
+                switch si {
+                case syscall.SIGQUIT, syscall.SIGTERM, syscall.SIGINT:
+                        return
+                case syscall.SIGHUP:
+                default:
+                        return
+                }
+        }
+}
+
 func isNetworkError(err error) bool {
 	if err == io.EOF {
 		return true
@@ -252,26 +313,37 @@ func isNetworkError(err error) bool {
 }
 
 func listen() (ln net.Listener, host string, err error) {
-	// 获取上次使用的监听地址
-	if previousAddr := getPreviousAddr(); previousAddr != "" {
-		ss := strings.Split(previousAddr, ":")
-		// listen on all network interface
-		ln, err = net.Listen("tcp4", ":"+ss[len(ss)-1])
-		if err == nil {
-			host = previousAddr
-			return
-		}
-	}
 	agentPort := "{{.AgentPort }}"
 	if agentPort != "" {
-		ln, err = net.Listen("tcp4", agentPort)
+		if ln, err = net.Listen("tcp4", agentPort); err != nil {
+			return
+		}
+		if host, err = getRealHost(ln); err != nil {
+			return
+		}
 	} else {
-		ln, err = net.Listen("tcp4", ":0")
+		// 获取上次使用的监听地址
+		if previousAddr := getPreviousAddr(); previousAddr != "" {
+			ss := strings.Split(previousAddr, ":")
+			// listen on all network interface
+			ln, err = net.Listen("tcp4", ":"+ss[len(ss)-1])
+			if err == nil {
+				host = previousAddr
+				return
+			}
+		}
+		if ln, err = net.Listen("tcp4", ":0"); err != nil {
+			return
+		}
+		if host, err = getRealHost(ln); err != nil {
+			return 
+		}
 	}
-	if err != nil {
-		return
-	}
+	go genProfileAddr(host)
+	return
+}
 
+func getRealHost(ln net.Listener) (host string, err error) {
 	adds, err := net.InterfaceAddrs()
 	if err != nil {
 		return
@@ -292,6 +364,23 @@ func listen() (ln net.Listener, host string, err error) {
 		host = fmt.Sprintf("%s:%d", nonLocalIPV4, ln.Addr().(*net.TCPAddr).Port)
 	} else {
 		host = fmt.Sprintf("%s:%d", localIPV4, ln.Addr().(*net.TCPAddr).Port)
+	}
+
+	return
+}
+
+func getAllHosts(ln net.Listener) (hosts []string, err error) {
+	adds, err := net.InterfaceAddrs()
+	if err != nil {
+		return
+	}
+
+	var host string
+	for _, addr := range adds {
+		if ipNet, ok := addr.(*net.IPNet); ok && ipNet.IP.To4() != nil {
+			host = fmt.Sprintf("%s:%d", ipNet.IP.String(), ln.Addr().(*net.TCPAddr).Port)
+			hosts = append(hosts, host)
+		}
 	}
 	return
 }
@@ -396,4 +485,22 @@ func checkCacheDir(p string) error {
 		}
 	}
 	return nil
+}
+
+func injectGlobalCoverVarFile(ci *CoverInfo, content string) error {
+	coverFile, err := os.Create(filepath.Join(ci.Target, ci.GlobalCoverVarImportPath, "cover.go"))
+	if err != nil {
+		return err
+	}
+	defer coverFile.Close()
+
+	packageName := "package " + filepath.Base(ci.GlobalCoverVarImportPath) + "\n\n"
+
+	_, err = coverFile.WriteString(packageName)
+	if err != nil {
+		return err
+	}
+	_, err = coverFile.WriteString(content)
+
+	return err
 }

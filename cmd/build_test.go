@@ -58,7 +58,7 @@ func TestGeneratedBinary(t *testing.T) {
 	assert.Equal(t, cnt > 0, true, "main.registerSelf function should be in the binary")
 
 	cnt = strings.Count(string(out), "GoCover")
-	assert.Equal(t, cnt > 0, true, "GoCover varibale should be in the binary")
+	assert.Equal(t, cnt > 0, true, "GoCover variable should be in the binary")
 }
 
 func TestBuildBinaryName(t *testing.T) {
@@ -86,7 +86,7 @@ func TestBuildBinaryName(t *testing.T) {
 	assert.Equal(t, cnt > 0, true, "main.registerSelf function should be in the binary")
 
 	cnt = strings.Count(string(out), "GoCover")
-	assert.Equal(t, cnt > 0, true, "GoCover varibale should be in the binary")
+	assert.Equal(t, cnt > 0, true, "GoCover variable should be in the binary")
 }
 
 // test if goc can get variables in internal package
@@ -107,13 +107,4 @@ func TestBuildBinaryForInternalPackage(t *testing.T) {
 	fInfo, err := os.Lstat(obj)
 	assert.Equal(t, err, nil, "the binary should be generated.")
 	assert.Equal(t, startTime.Before(fInfo.ModTime()), true, obj+"new binary should be generated, not the old one")
-
-	cmd := exec.Command("go", "tool", "objdump", "simple-project")
-	cmd.Dir = workingDir
-	out, _ := cmd.CombinedOutput()
-	cnt := strings.Count(string(out), "GoCacheCover")
-	assert.Equal(t, cnt > 0, true, "GoCacheCover variable for internal package should be in the binary")
-
-	cnt = strings.Count(string(out), "internal.GoCover")
-	assert.Equal(t, cnt > 0, true, "internal.GoCover varibale should be in the binary")
 }

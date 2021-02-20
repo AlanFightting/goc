@@ -43,23 +43,33 @@ type Config struct {
 	Domain string `json:"domain"`
 }
 
-// Client for the operation with qiniu cloud
-type Client struct {
+// Client is the interface contains the operation with qiniu cloud
+type Client interface {
+	QiniuObjectHandle(key string) ObjectHandle
+	ReadObject(key string) ([]byte, error)
+	ListAll(ctx context.Context, prefix string, delimiter string) ([]string, error)
+	GetAccessURL(key string, timeout time.Duration) string
+	GetArtifactDetails(key string) (*LogHistoryTemplate, error)
+	ListSubDirs(prefix string) ([]string, error)
+}
+
+// QnClient for the operation with qiniu cloud
+type QnClient struct {
 	cfg           *Config
 	BucketManager *storage.BucketManager
 }
 
-// NewClient creates a new client to work with qiniu cloud
-func NewClient(cfg *Config) *Client {
-	return &Client{
+// NewClient creates a new QnClient to work with qiniu cloud
+func NewClient(cfg *Config) *QnClient {
+	return &QnClient{
 		cfg:           cfg,
 		BucketManager: storage.NewBucketManager(qbox.NewMac(cfg.AccessKey, cfg.SecretKey), nil),
 	}
 }
 
 // QiniuObjectHandle construct a object hanle to access file in qiniu
-func (q *Client) QiniuObjectHandle(key string) *ObjectHandle {
-	return &ObjectHandle{
+func (q *QnClient) QiniuObjectHandle(key string) ObjectHandle {
+	return &QnObjectHandle{
 		key:    key,
 		cfg:    q.cfg,
 		bm:     q.BucketManager,
@@ -69,7 +79,7 @@ func (q *Client) QiniuObjectHandle(key string) *ObjectHandle {
 }
 
 // ReadObject to read all the content of key
-func (q *Client) ReadObject(key string) ([]byte, error) {
+func (q *QnClient) ReadObject(key string) ([]byte, error) {
 	objectHandle := q.QiniuObjectHandle(key)
 	reader, err := objectHandle.NewReader(context.Background())
 	if err != nil {
@@ -80,7 +90,7 @@ func (q *Client) ReadObject(key string) ([]byte, error) {
 }
 
 // ListAll to list all the files with contains the expected prefix
-func (q *Client) ListAll(ctx context.Context, prefix string, delimiter string) ([]string, error) {
+func (q *QnClient) ListAll(ctx context.Context, prefix string, delimiter string) ([]string, error) {
 	var files []string
 	artifacts, err := q.listEntries(prefix, delimiter)
 	if err != nil {
@@ -94,8 +104,8 @@ func (q *Client) ListAll(ctx context.Context, prefix string, delimiter string) (
 	return files, nil
 }
 
-// ListAll to list all the entries with contains the expected prefix
-func (q *Client) listEntries(prefix string, delimiter string) ([]storage.ListItem, error) {
+// listEntries to list all the entries with contains the expected prefix
+func (q *QnClient) listEntries(prefix string, delimiter string) ([]storage.ListItem, error) {
 	var marker string
 	var artifacts []storage.ListItem
 
@@ -124,17 +134,19 @@ func (q *Client) listEntries(prefix string, delimiter string) ([]storage.ListIte
 }
 
 // GetAccessURL return a url which can access artifact directly in qiniu
-func (q *Client) GetAccessURL(key string, timeout time.Duration) string {
+func (q *QnClient) GetAccessURL(key string, timeout time.Duration) string {
 	deadline := time.Now().Add(timeout).Unix()
 	return storage.MakePrivateURL(qbox.NewMac(q.cfg.AccessKey, q.cfg.SecretKey), q.cfg.Domain, key, deadline)
 }
 
+// LogHistoryTemplate is the template of the log history
 type LogHistoryTemplate struct {
 	BucketName string
 	KeyPath    string
 	Items      []logHistoryItem
 }
 
+// logHistoryItem represents a log history item
 type logHistoryItem struct {
 	Name string
 	Size string
@@ -142,8 +154,8 @@ type logHistoryItem struct {
 	Url  string
 }
 
-// Artifacts lists all artifacts available for the given job source
-func (q *Client) GetArtifactDetails(key string) (*LogHistoryTemplate, error) {
+// GetArtifactDetails lists all artifacts available for the given job source
+func (q *QnClient) GetArtifactDetails(key string) (*LogHistoryTemplate, error) {
 	tmpl := new(LogHistoryTemplate)
 	item := logHistoryItem{}
 	listStart := time.Now()
@@ -183,7 +195,8 @@ func timeConv(ptime int64) string {
 	return tm.Format("2006-01-02 03:04:05 PM")
 }
 
-func (q *Client) ListSubDirs(prefix string) ([]string, error) {
+// ListSubDirs list all the sub directions of the prefix string in qiniu client
+func (q *QnClient) ListSubDirs(prefix string) ([]string, error) {
 	var dirs []string
 	var marker string
 
